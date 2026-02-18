@@ -4,7 +4,7 @@ const PORT = process.env.PORT || 10000;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 
 if (!SONIOX_API_KEY) {
-  throw new Error("SONIOX_API_KEY is required");
+  console.error("SONIOX_API_KEY is required");
 }
 
 const server = new WebSocketServer({ port: PORT });
