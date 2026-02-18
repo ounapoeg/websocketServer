@@ -1,4 +1,3 @@
-// server.js
 import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
@@ -17,13 +16,10 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 
 wss.on("connection", (vapiWs, req) => {
-  console.log("Vapi connected", {
-    ip: req.socket.remoteAddress,
-    ua: req.headers["user-agent"],
-  });
+  console.log("✅ Vapi connected");
 
   if (!SONIOX_API_KEY) {
-    console.error("Missing SONIOX_API_KEY");
+    console.error("❌ Missing SONIOX_API_KEY");
     vapiWs.close(1011, "Missing SONIOX_API_KEY");
     return;
   }
@@ -31,92 +27,99 @@ wss.on("connection", (vapiWs, req) => {
   const sonioxWs = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
 
   sonioxWs.on("open", () => {
-    console.log("Connected to Soniox, sending config");
+    console.log("✅ Connected to Soniox, sending config");
+
+    // ✅ IMPORTANT: raw PCM config matching Vapi audio
     sonioxWs.send(
       JSON.stringify({
         api_key: SONIOX_API_KEY,
         model: "stt-rt-preview",
-        audio_format: "auto",
-        enable_endpoint_detection: true,
+        audio_format: "pcm_s16le",
+        sample_rate: 16000,
+        num_channels: 1,
+        enable_endpoint_detection: true
       })
     );
   });
 
-  sonioxWs.on("close", (code, reason) => {
-    console.log("Soniox closed", { code, reason: reason?.toString?.() });
-    try {
-      vapiWs.close();
-    } catch {}
-  });
-
   sonioxWs.on("error", (err) => {
-    console.error("Soniox ws error", err);
-    try {
-      vapiWs.close(1011, "Soniox ws error");
-    } catch {}
+    console.error("❌ Soniox WebSocket error:", err);
+    vapiWs.close(1011, "Soniox connection error");
   });
 
-  // Vapi -> Soniox (audio frames)
-  vapiWs.on("message", (data) => {
-    const isBinary = Buffer.isBuffer(data);
-    console.log(
-      "Received from Vapi:",
-      isBinary ? `binary ${data.length} bytes` : `text ${data.toString().slice(0, 120)}`
-    );
+  sonioxWs.on("close", (code, reason) => {
+    console.log("🔌 Soniox closed", code, reason?.toString());
+    vapiWs.close();
+  });
 
+  // ✅ Forward binary audio frames from Vapi → Soniox
+  vapiWs.on("message", (data) => {
+    if (Buffer.isBuffer(data)) {
+      console.log("🎤 Audio chunk:", data.length, "bytes");
+    }
     if (sonioxWs.readyState === WebSocket.OPEN) {
       sonioxWs.send(data);
     }
   });
 
-  vapiWs.on("close", (code, reason) => {
-    console.log("Vapi closed", { code, reason: reason?.toString?.() });
-    try {
-      sonioxWs.close();
-    } catch {}
+  vapiWs.on("close", () => {
+    console.log("🔌 Vapi closed");
+    sonioxWs.close();
   });
 
   vapiWs.on("error", (err) => {
-    console.error("Vapi ws error", err);
-    try {
-      sonioxWs.close();
-    } catch {}
+    console.error("❌ Vapi WebSocket error:", err);
+    sonioxWs.close();
   });
 
-  // Soniox -> Vapi (transcript frames)
+  // ✅ Handle Soniox responses
   sonioxWs.on("message", (data) => {
     const raw = data.toString();
-    console.log("Received from Soniox:", raw.slice(0, 300));
+    console.log("📩 Soniox response:", raw.slice(0, 300));
 
     let response;
     try {
       response = JSON.parse(raw);
-    } catch (e) {
-      console.error("Soniox JSON parse error", e);
+    } catch (err) {
+      console.error("❌ Soniox JSON parse error");
       return;
     }
 
-    // Keep it simple + compatible: only emit FINAL transcripts to Vapi.
-    const finalTokens = response.tokens?.filter((t) => t && t.is_final);
+    // ✅ Handle Soniox error messages
+    if (response.error_code) {
+      console.error(
+        "❌ Soniox error:",
+        response.error_code,
+        response.error_message
+      );
+      vapiWs.close(1011, response.error_message);
+      sonioxWs.close();
+      return;
+    }
+
+    // ✅ Only emit FINAL transcripts to Vapi
+    const finalTokens = response.tokens?.filter(t => t.is_final);
     if (!finalTokens?.length) return;
 
-    // Join token texts with spaces; trim to avoid double spaces.
     const transcript = finalTokens
-      .map((t) => t.text)
+      .map(t => t.text)
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
 
     if (!transcript) return;
 
-    try {
-      vapiWs.send(JSON.stringify({ transcript, isFinal: true }));
-    } catch (e) {
-      console.error("Failed sending transcript to Vapi", e);
-    }
+    console.log("📝 Sending transcript to Vapi:", transcript);
+
+    vapiWs.send(
+      JSON.stringify({
+        transcript,
+        isFinal: true
+      })
+    );
   });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTTP+WS proxy listening on ${PORT}`);
+  console.log(`🚀 Proxy listening on port ${PORT}`);
 });
