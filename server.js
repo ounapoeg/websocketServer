@@ -68,7 +68,7 @@ wss.on("connection", (vapiWs) => {
         api_key: SONIOX_API_KEY,
         model: "stt-rt-v4",
         audio_format: "pcm_s16le",
-        sample_rate: 48000,
+        sample_rate: 44100,
         num_channels: 1,
         language_hints: ["et"],
         enable_endpoint_detection: true,
