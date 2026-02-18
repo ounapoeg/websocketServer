@@ -124,15 +124,17 @@ wss.on("connection", (vapiWs) => {
     console.log("📝 Sending transcript to Vapi:", transcript, "final:", isFinal);
 
     try {
-      vapiWs.send(
-        JSON.stringify({
-          transcript,
-          isFinal,
-        })
-      );
-    } catch (err) {
-      console.error("❌ Failed sending transcript to Vapi", err);
-    }
+  vapiWs.send(
+    JSON.stringify({
+      type: "transcriber-response",
+      transcription: transcript,
+      channel: "customer",
+      isFinal: isFinal
+    })
+  );
+} catch (err) {
+  console.error("❌ Failed sending transcript to Vapi", err);
+}
   });
 });
 
