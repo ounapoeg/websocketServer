@@ -15,7 +15,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-wss.on("connection", (vapiWs, req) => {
+wss.on("connection", (vapiWs) => {
   console.log("✅ Vapi connected");
 
   if (!SONIOX_API_KEY) {
@@ -29,7 +29,6 @@ wss.on("connection", (vapiWs, req) => {
   sonioxWs.on("open", () => {
     console.log("✅ Connected to Soniox, sending config");
 
-    // ✅ IMPORTANT: raw PCM config matching Vapi audio
     sonioxWs.send(
       JSON.stringify({
         api_key: SONIOX_API_KEY,
@@ -38,26 +37,33 @@ wss.on("connection", (vapiWs, req) => {
         sample_rate: 16000,
         num_channels: 1,
         language_hints: ["en", "et"],
-        enable_endpoint_detection: true
+        enable_endpoint_detection: true,
       })
     );
   });
 
   sonioxWs.on("error", (err) => {
     console.error("❌ Soniox WebSocket error:", err);
-    vapiWs.close(1011, "Soniox connection error");
+    try {
+      vapiWs.close(1011, "Soniox connection error");
+    } catch {}
   });
 
   sonioxWs.on("close", (code, reason) => {
     console.log("🔌 Soniox closed", code, reason?.toString());
-    vapiWs.close();
+    try {
+      vapiWs.close();
+    } catch {}
   });
 
-  // ✅ Forward binary audio frames from Vapi → Soniox
+  // Vapi -> Soniox (audio)
   vapiWs.on("message", (data) => {
     if (Buffer.isBuffer(data)) {
       console.log("🎤 Audio chunk:", data.length, "bytes");
+    } else {
+      console.log("📨 Non-binary from Vapi:", data.toString().slice(0, 200));
     }
+
     if (sonioxWs.readyState === WebSocket.OPEN) {
       sonioxWs.send(data);
     }
@@ -65,15 +71,19 @@ wss.on("connection", (vapiWs, req) => {
 
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
-    sonioxWs.close();
+    try {
+      sonioxWs.close();
+    } catch {}
   });
 
   vapiWs.on("error", (err) => {
     console.error("❌ Vapi WebSocket error:", err);
-    sonioxWs.close();
+    try {
+      sonioxWs.close();
+    } catch {}
   });
 
-  // ✅ Handle Soniox responses
+  // Soniox -> Vapi (transcripts)
   sonioxWs.on("message", (data) => {
     const raw = data.toString();
     console.log("📩 Soniox response:", raw.slice(0, 300));
@@ -82,47 +92,47 @@ wss.on("connection", (vapiWs, req) => {
     try {
       response = JSON.parse(raw);
     } catch (err) {
-      console.error("❌ Soniox JSON parse error");
+      console.error("❌ Soniox JSON parse error", err);
       return;
     }
 
-    // ✅ Handle Soniox error messages
+    // Soniox errors
     if (response.error_code) {
-      console.error(
-        "❌ Soniox error:",
-        response.error_code,
-        response.error_message
-      );
-      vapiWs.close(1011, response.error_message);
-      sonioxWs.close();
+      console.error("❌ Soniox error:", response.error_code, response.error_message);
+      try {
+        vapiWs.close(1011, response.error_message || "Soniox error");
+      } catch {}
+      try {
+        sonioxWs.close();
+      } catch {}
       return;
     }
 
-    // ✅ Only emit FINAL transcripts to Vapi
     const tokens = response.tokens;
-if (!tokens?.length) return;
+    if (!tokens || tokens.length === 0) return;
 
-const isFinal = tokens.some(t => t.is_final);
-
-vapiWs.send(JSON.stringify({ transcript, isFinal }));
-    if (!finalTokens?.length) return;
-
-    const transcript = finalTokens
-      .map(t => t.text)
+    const transcript = tokens
+      .map((t) => t.text)
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
 
+    const isFinal = tokens.some((t) => t.is_final);
+
     if (!transcript) return;
 
-    console.log("📝 Sending transcript to Vapi:", transcript);
+    console.log("📝 Sending transcript to Vapi:", transcript, "final:", isFinal);
 
-    vapiWs.send(
-      JSON.stringify({
-        transcript,
-        isFinal: true
-      })
-    );
+    try {
+      vapiWs.send(
+        JSON.stringify({
+          transcript,
+          isFinal,
+        })
+      );
+    } catch (err) {
+      console.error("❌ Failed sending transcript to Vapi", err);
+    }
   });
 });
 
