@@ -79,7 +79,7 @@ wss.on("connection", (vapiWs) => {
     sonioxWs.send(
       JSON.stringify({
         api_key: SONIOX_API_KEY,
-        model: "stt-rt-v4",
+        model: "stt-rt-preview",
         audio_format: "pcm_s16le",
         sample_rate: 48000,   // ✅ we resample to 48k
         num_channels: 1,
