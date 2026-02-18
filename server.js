@@ -1,4 +1,4 @@
-vimport http from "http";
+import http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 10000;
