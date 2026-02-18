@@ -1,4 +1,4 @@
-import http from "http";
+vimport http from "http";
 import WebSocket, { WebSocketServer } from "ws";
 
 const PORT = process.env.PORT || 10000;
@@ -37,6 +37,7 @@ wss.on("connection", (vapiWs, req) => {
         audio_format: "pcm_s16le",
         sample_rate: 16000,
         num_channels: 1,
+        language_hints: ["en", "es"],
         enable_endpoint_detection: true
       })
     );
