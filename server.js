@@ -4,7 +4,7 @@ import WebSocket, { WebSocketServer } from "ws";
 const PORT = process.env.PORT || 10000;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 
-/* -------------------- RMS DEBUG -------------------- */
+/* -------------------- AUDIO DEBUG -------------------- */
 
 function rmsS16LE(buf) {
   const n = Math.floor(buf.length / 2);
@@ -15,6 +15,16 @@ function rmsS16LE(buf) {
     sumSq += s * s;
   }
   return Math.sqrt(sumSq / n);
+}
+
+function peakAbsS16LE(buf) {
+  const n = Math.floor(buf.length / 2);
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    const s = Math.abs(buf.readInt16LE(i * 2));
+    if (s > peak) peak = s;
+  }
+  return peak;
 }
 
 /* -------------------- HTTP SERVER -------------------- */
@@ -32,8 +42,6 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server });
 
-/* -------------------- MAIN CONNECTION -------------------- */
-
 wss.on("connection", (vapiWs) => {
   console.log("✅ Vapi connected");
 
@@ -43,24 +51,24 @@ wss.on("connection", (vapiWs) => {
     return;
   }
 
-  const sonioxWs = new WebSocket(
-    "wss://stt-rt.soniox.com/transcribe-websocket"
-  );
+  const sonioxWs = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
 
   sonioxWs.on("open", () => {
     console.log("✅ Connected to Soniox, sending config");
 
-    // ✅ EXACT MATCH to observed audio
-    sonioxWs.send(JSON.stringify({
-      api_key: SONIOX_API_KEY,
-      model: "stt-rt-preview",
-      audio_format: "pcm_s16le",
-      sample_rate: 44100,   // ✅ confirmed by frame math
-      num_channels: 1,
-      language_hints: ["et"],
-      language_hints_strict: true,
-      enable_endpoint_detection: true
-    }));
+    // Matches what we've observed from Vapi Web calls: raw PCM s16le @ 44.1kHz mono
+    sonioxWs.send(
+      JSON.stringify({
+        api_key: SONIOX_API_KEY,
+        model: "stt-rt-preview",
+        audio_format: "pcm_s16le",
+        sample_rate: 44100,
+        num_channels: 1,
+        language_hints: ["en"],
+        language_hints_strict: true,
+        enable_endpoint_detection: true
+      })
+    );
   });
 
   sonioxWs.on("error", (err) => {
@@ -76,23 +84,22 @@ wss.on("connection", (vapiWs) => {
   let frameCount = 0;
 
   /* -------- Vapi → Soniox (Raw Audio) -------- */
-
   vapiWs.on("message", (data) => {
     if (!Buffer.isBuffer(data)) return;
 
     frameCount++;
-    if (frameCount % 50 === 0) {
-      console.log("🔎 RMS:", rmsS16LE(data).toFixed(2), "bytes:", data.length);
+
+    // Debug every ~20 frames
+    if (frameCount % 20 === 0) {
+      const rms = rmsS16LE(data);
+      const peak = peakAbsS16LE(data);
+      console.log(`🔎 Audio stats rms=${rms.toFixed(2)} peak=${peak} bytes=${data.length}`);
     }
 
     if (sonioxWs.readyState === WebSocket.OPEN) {
-      sonioxWs.send(data); // ✅ no resampling
+      sonioxWs.send(data);
     }
   });
-
-  if (frameCount % 20 === 0) {
-  console.log("Peak sample:", Math.max(...Array.from({length: data.length/2}, (_, i) => Math.abs(data.readInt16LE(i*2)))));
-  }
 
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
@@ -103,7 +110,6 @@ wss.on("connection", (vapiWs) => {
   });
 
   /* -------- Soniox → Vapi (Transcript) -------- */
-
   sonioxWs.on("message", (data) => {
     const raw = data.toString();
     console.log("📩 Soniox response:", raw.slice(0, 200));
@@ -123,9 +129,9 @@ wss.on("connection", (vapiWs) => {
     const tokens = response.tokens;
     if (!tokens || tokens.length === 0) return;
 
-    // ✅ Build live hypothesis (partial + final)
+    // Send live hypothesis (partial + final)
     const hypothesis = tokens
-      .map(t => t.text)
+      .map((t) => t.text)
       .join("")
       .replace(/\s+/g, " ")
       .trim();
@@ -134,15 +140,15 @@ wss.on("connection", (vapiWs) => {
 
     console.log("📝 Sending transcription:", hypothesis);
 
-    vapiWs.send(JSON.stringify({
-      type: "transcriber-response",
-      transcription: hypothesis,
-      channel: "customer"
-    }));
+    vapiWs.send(
+      JSON.stringify({
+        type: "transcriber-response",
+        transcription: hypothesis,
+        channel: "customer"
+      })
+    );
   });
 });
-
-/* -------------------- START SERVER -------------------- */
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Proxy listening on port ${PORT}`);
