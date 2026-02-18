@@ -90,6 +90,10 @@ wss.on("connection", (vapiWs) => {
     }
   });
 
+  if (frameCount % 20 === 0) {
+  console.log("Peak sample:", Math.max(...Array.from({length: data.length/2}, (_, i) => Math.abs(data.readInt16LE(i*2)))));
+  }
+
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
     try {
