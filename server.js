@@ -37,7 +37,7 @@ wss.on("connection", (vapiWs, req) => {
         audio_format: "pcm_s16le",
         sample_rate: 16000,
         num_channels: 1,
-        language_hints: ["en", "es"],
+        language_hints: ["en", "et"],
         enable_endpoint_detection: true
       })
     );
