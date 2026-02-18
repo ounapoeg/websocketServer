@@ -57,7 +57,7 @@ wss.on("connection", (vapiWs) => {
       audio_format: "pcm_s16le",
       sample_rate: 44100,   // ✅ confirmed by frame math
       num_channels: 1,
-      language_hints: ["en"],
+      language_hints: ["et"],
       language_hints_strict: true,
       enable_endpoint_detection: true
     }));
