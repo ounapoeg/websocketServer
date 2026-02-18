@@ -26,6 +26,8 @@ wss.on("connection", (vapiWs) => {
     return;
   }
 
+  let accumulatedText = "";
+
   const sonioxWs = new WebSocket(
     "wss://stt-rt.soniox.com/transcribe-websocket"
   );
@@ -38,7 +40,7 @@ wss.on("connection", (vapiWs) => {
         api_key: SONIOX_API_KEY,
         model: "stt-rt-v4",
         audio_format: "pcm_s16le",
-        sample_rate: 48000, // ✅ WebRTC uses 48kHz
+        sample_rate: 48000, // WebRTC uses 48kHz
         num_channels: 1,
         language_hints: ["en", "et"],
         enable_endpoint_detection: true
@@ -56,10 +58,12 @@ wss.on("connection", (vapiWs) => {
     try { vapiWs.close(); } catch {}
   });
 
+  // Forward audio from Vapi → Soniox
   vapiWs.on("message", (data) => {
     if (Buffer.isBuffer(data)) {
       console.log("🎤 Audio chunk:", data.length, "bytes");
     }
+
     if (sonioxWs.readyState === WebSocket.OPEN) {
       sonioxWs.send(data);
     }
@@ -70,6 +74,7 @@ wss.on("connection", (vapiWs) => {
     try { sonioxWs.close(); } catch {}
   });
 
+  // Handle Soniox responses
   sonioxWs.on("message", (data) => {
     const raw = data.toString();
     console.log("📩 Soniox response:", raw.slice(0, 200));
@@ -77,35 +82,39 @@ wss.on("connection", (vapiWs) => {
     let response;
     try {
       response = JSON.parse(raw);
-    } catch (err) {
+    } catch {
       console.error("❌ JSON parse error");
       return;
     }
 
     if (response.error_code) {
       console.error("❌ Soniox error:", response.error_message);
-      try { vapiWs.close(); } catch {}
-      try { sonioxWs.close(); } catch {}
       return;
     }
 
     const tokens = response.tokens;
     if (!tokens || tokens.length === 0) return;
 
-    const transcript = tokens
+    // ✅ Only append FINAL tokens (prevents duplication)
+    const finalTokens = tokens.filter(t => t.is_final);
+    if (!finalTokens.length) return;
+
+    const newText = finalTokens
       .map(t => t.text)
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
 
-    if (!transcript) return;
+    if (!newText) return;
 
-    console.log("📝 Sending transcript:", transcript);
+    accumulatedText += (accumulatedText ? " " : "") + newText;
+
+    console.log("📝 Sending transcript:", accumulatedText);
 
     try {
       vapiWs.send(JSON.stringify({
         type: "transcriber-response",
-        transcription: transcript,
+        transcription: accumulatedText,
         channel: "customer"
       }));
     } catch (err) {
