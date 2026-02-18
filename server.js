@@ -41,7 +41,7 @@ wss.on("connection", (vapiWs) => {
         model: "stt-rt-v4",
         audio_format: "pcm_s16le",
         sample_rate: 48000, // WebRTC uses 48kHz
-        num_channels: 1,
+        num_channels: 2,
         language_hints: ["en", "et"],
         enable_endpoint_detection: true
       })
