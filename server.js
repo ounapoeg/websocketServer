@@ -75,18 +75,15 @@ wss.on("connection", (vapiWs) => {
   sonioxWs.on("open", () => {
     console.log("✅ Connected to Soniox, sending config");
 
-    sonioxWs.send(
-      JSON.stringify({
-        api_key: SONIOX_API_KEY,
-        model: "stt-rt-preview",
-        audio_format: "pcm_s16le",
-        sample_rate: 16000,  // ✅ now 16k
-        num_channels: 1,
-        language_hints: ["et"],
-        enable_endpoint_detection: true,
-        max_endpoint_delay_ms: 1500
-      })
-    );
+    sonioxWs.send(JSON.stringify({
+  api_key: SONIOX_API_KEY,
+  model: "stt-rt-preview",
+  audio_format: "pcm_s16le",
+  sample_rate: 16000,
+  num_channels: 1,
+  language_hints: ["en"],
+  enable_endpoint_detection: true
+}));
   });
 
   sonioxWs.on("error", (err) => {
