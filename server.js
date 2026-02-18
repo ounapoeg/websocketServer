@@ -17,15 +17,15 @@ function rmsS16LE(buf) {
   return Math.sqrt(sumSq / n);
 }
 
-/* -------------------- 44.1k → 48k RESAMPLER -------------------- */
+/* -------------------- 44.1k → 16k RESAMPLER -------------------- */
 
-function resample441to48000(buffer) {
+function resample441to16000(buffer) {
   const inputSamples = buffer.length / 2;
-  const outputSamples = Math.floor(inputSamples * (48000 / 44100));
+  const outputSamples = Math.floor(inputSamples * (16000 / 44100));
   const output = Buffer.alloc(outputSamples * 2);
 
   for (let i = 0; i < outputSamples; i++) {
-    const t = i * (44100 / 48000);
+    const t = i * (44100 / 16000);
     const i0 = Math.floor(t);
     const i1 = Math.min(i0 + 1, inputSamples - 1);
     const frac = t - i0;
@@ -66,7 +66,6 @@ wss.on("connection", (vapiWs) => {
     return;
   }
 
-  let accumulatedText = "";
   let frameCount = 0;
 
   const sonioxWs = new WebSocket(
@@ -81,10 +80,11 @@ wss.on("connection", (vapiWs) => {
         api_key: SONIOX_API_KEY,
         model: "stt-rt-preview",
         audio_format: "pcm_s16le",
-        sample_rate: 48000,   // ✅ we resample to 48k
+        sample_rate: 16000,  // ✅ now 16k
         num_channels: 1,
-        language_hints: ["en", "et"],
-        enable_endpoint_detection: true
+        language_hints: ["et"],
+        enable_endpoint_detection: true,
+        max_endpoint_delay_ms: 1500
       })
     );
   });
@@ -105,13 +105,12 @@ wss.on("connection", (vapiWs) => {
     if (!Buffer.isBuffer(data)) return;
 
     frameCount++;
-
     if (frameCount % 50 === 0) {
       console.log("🔎 RMS s16le:", rmsS16LE(data).toFixed(2), "bytes:", data.length);
     }
 
-    // ✅ Resample from 44.1k → 48k before sending
-    const resampled = resample441to48000(data);
+    // ✅ Resample from 44.1k → 16k
+    const resampled = resample441to16000(data);
 
     if (sonioxWs.readyState === WebSocket.OPEN) {
       sonioxWs.send(resampled);
@@ -120,6 +119,9 @@ wss.on("connection", (vapiWs) => {
 
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
+    try {
+      sonioxWs.send(JSON.stringify({ type: "finalize" }));
+    } catch {}
     try { sonioxWs.close(); } catch {}
   });
 
@@ -144,25 +146,20 @@ wss.on("connection", (vapiWs) => {
     const tokens = response.tokens;
     if (!tokens || tokens.length === 0) return;
 
-    // Only append FINAL tokens
-    const finalTokens = tokens.filter(t => t.is_final);
-    if (!finalTokens.length) return;
-
-    const newText = finalTokens
+    // ✅ Build current hypothesis (both final + non-final)
+    const hypothesis = tokens
       .map(t => t.text)
       .join(" ")
       .replace(/\s+/g, " ")
       .trim();
 
-    if (!newText) return;
+    if (!hypothesis) return;
 
-    accumulatedText += (accumulatedText ? " " : "") + newText;
-
-    console.log("📝 Sending transcription:", accumulatedText);
+    console.log("📝 Sending hypothesis:", hypothesis);
 
     vapiWs.send(JSON.stringify({
       type: "transcriber-response",
-      transcription: accumulatedText,
+      transcription: hypothesis,
       channel: "customer"
     }));
   });
