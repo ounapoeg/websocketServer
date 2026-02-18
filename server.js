@@ -29,18 +29,15 @@ wss.on("connection", (vapiWs) => {
   sonioxWs.on("open", () => {
     console.log("✅ Connected to Soniox, sending config");
 
-    sonioxWs.send(
-      JSON.stringify({
-        api_key: SONIOX_API_KEY,
-        model: "stt-rt-v4",
-        audio_format: "pcm_s16le",
-        sample_rate: 16000,
-        num_channels: 1,
-        language_hints: ["en", "et"],
-        enable_endpoint_detection: true,
-      })
-    );
-  });
+    sonioxWs.send(JSON.stringify({
+  api_key: SONIOX_API_KEY,
+  model: "stt-rt-v4",
+  audio_format: "pcm_s16le",
+  sample_rate: 48000,
+  num_channels: 1,
+  language_hints: ["en", "et"],
+  enable_endpoint_detection: true
+}));
 
   sonioxWs.on("error", (err) => {
     console.error("❌ Soniox WebSocket error:", err);
