@@ -39,9 +39,9 @@ wss.on("connection", (vapiWs) => {
       JSON.stringify({
         api_key: SONIOX_API_KEY,
         model: "stt-rt-v4",
-        audio_format: "pcm_s16le",
+        audio_format: "pcm_f32le",
         sample_rate: 48000, // WebRTC uses 48kHz
-        num_channels: 2,
+        num_channels: 1,
         language_hints: ["en", "et"],
         enable_endpoint_detection: true
       })
