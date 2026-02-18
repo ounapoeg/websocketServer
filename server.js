@@ -102,12 +102,6 @@ wss.on("connection", (vapiWs, req) => {
     const tokens = response.tokens;
 if (!tokens?.length) return;
 
-const transcript = tokens
-  .map(t => t.text)
-  .join(" ")
-  .replace(/\s+/g, " ")
-  .trim();
-
 const isFinal = tokens.some(t => t.is_final);
 
 vapiWs.send(JSON.stringify({ transcript, isFinal }));
