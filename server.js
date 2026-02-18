@@ -128,8 +128,7 @@ wss.on("connection", (vapiWs) => {
     JSON.stringify({
       type: "transcriber-response",
       transcription: transcript,
-      channel: "customer",
-      isFinal: isFinal
+      channel: "customer"
     })
   );
 } catch (err) {
