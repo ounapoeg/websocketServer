@@ -99,7 +99,18 @@ wss.on("connection", (vapiWs, req) => {
     }
 
     // ✅ Only emit FINAL transcripts to Vapi
-    const finalTokens = response.tokens?.filter(t => t.is_final);
+    const tokens = response.tokens;
+if (!tokens?.length) return;
+
+const transcript = tokens
+  .map(t => t.text)
+  .join(" ")
+  .replace(/\s+/g, " ")
+  .trim();
+
+const isFinal = tokens.some(t => t.is_final);
+
+vapiWs.send(JSON.stringify({ transcript, isFinal }));
     if (!finalTokens?.length) return;
 
     const transcript = finalTokens
