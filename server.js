@@ -147,7 +147,6 @@ wss.on("connection", (vapiWs) => {
           JSON.stringify({
             type: "transcriber-response",
             transcription: fullHypothesis,
-            isFinal,
             channel: "customer",
           })
         );
