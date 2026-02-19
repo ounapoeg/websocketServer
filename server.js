@@ -4,6 +4,35 @@ import WebSocket, { WebSocketServer } from "ws";
 const PORT = process.env.PORT || 10000;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 
+const INPUT_SAMPLE_RATE = 44100;
+const OUTPUT_SAMPLE_RATE = 16000;
+const RATIO = INPUT_SAMPLE_RATE / OUTPUT_SAMPLE_RATE; // 2.75625
+
+/* -------------------- RESAMPLE -------------------- */
+// Simple linear interpolation downsampler: 44100 → 16000
+function resampleS16LE(inputBuf) {
+  const inputSamples = Math.floor(inputBuf.length / 2);
+  const outputSamples = Math.floor(inputSamples / RATIO);
+  const outputBuf = Buffer.allocUnsafe(outputSamples * 2);
+
+  for (let i = 0; i < outputSamples; i++) {
+    const srcPos = i * RATIO;
+    const srcIdx = Math.floor(srcPos);
+    const frac = srcPos - srcIdx;
+
+    const s0 = inputBuf.readInt16LE(srcIdx * 2);
+    const s1 = srcIdx + 1 < inputSamples
+      ? inputBuf.readInt16LE((srcIdx + 1) * 2)
+      : s0;
+
+    const interpolated = Math.round(s0 + frac * (s1 - s0));
+    const clamped = Math.max(-32768, Math.min(32767, interpolated));
+    outputBuf.writeInt16LE(clamped, i * 2);
+  }
+
+  return outputBuf;
+}
+
 /* -------------------- AUDIO DEBUG -------------------- */
 function rmsS16LE(buf) {
   const n = Math.floor(buf.length / 2);
@@ -57,9 +86,9 @@ wss.on("connection", (vapiWs) => {
         api_key: SONIOX_API_KEY,
         model: "stt-rt-preview",
         audio_format: "pcm_s16le",
-        sample_rate: 16000,         // Vapi sends 16kHz telephony audio
+        sample_rate: OUTPUT_SAMPLE_RATE,  // 16000 after resampling
         num_channels: 1,
-        language_hints: ["et"],     // Estonian
+        language_hints: ["et"],           // Estonian
         language_hints_strict: true,
         enable_endpoint_detection: true
       })
@@ -80,7 +109,6 @@ wss.on("connection", (vapiWs) => {
 
   /* -------- Vapi → Soniox -------- */
   vapiWs.on("message", (data) => {
-    // Log non-binary messages from Vapi instead of silently dropping them
     if (!Buffer.isBuffer(data)) {
       console.log("📨 Vapi JSON message:", data.toString().slice(0, 300));
       return;
@@ -88,27 +116,28 @@ wss.on("connection", (vapiWs) => {
 
     frameCount++;
 
-    // Debug every ~20 frames
     if (frameCount % 20 === 0) {
       const rms = rmsS16LE(data);
       const peak = peakAbsS16LE(data);
-      console.log(`🔎 Audio stats rms=${rms.toFixed(2)} peak=${peak} bytes=${data.length}`);
+      console.log(`🔎 Raw audio  rms=${rms.toFixed(2)} peak=${peak} bytes=${data.length}`);
     }
 
-    if (sonioxWs.readyState === WebSocket.OPEN) {
-      sonioxWs.send(data);
+    if (sonioxWs.readyState !== WebSocket.OPEN) return;
+
+    const resampled = resampleS16LE(data);
+
+    if (frameCount % 20 === 0) {
+      const rms2 = rmsS16LE(resampled);
+      console.log(`🔎 Resampled  rms=${rms2.toFixed(2)} bytes=${resampled.length}`);
     }
+
+    sonioxWs.send(resampled);
   });
 
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
-    // Signal end of stream to Soniox so it flushes final transcript
-    if (sonioxWs.readyState === WebSocket.OPEN) {
-      try {
-        sonioxWs.send(JSON.stringify({ type: "end_of_stream" }));
-      } catch {}
-    }
-    try { sonioxWs.close(); } catch {}
+    // Just close the socket — Soniox does not accept a JSON end_of_stream message
+    try { sonioxWs.close(1000); } catch {}
   });
 
   /* -------- Soniox → Vapi (Transcript) -------- */
@@ -131,32 +160,17 @@ wss.on("connection", (vapiWs) => {
     const tokens = response.tokens;
     if (!tokens || tokens.length === 0) return;
 
-    // Separate final and non-final tokens
     const finalTokens = tokens.filter((t) => t.is_final);
     const partialTokens = tokens.filter((t) => !t.is_final);
 
-    // Build final transcript text (committed words)
-    const finalText = finalTokens
-      .map((t) => t.text)
-      .join("")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    // Build partial/hypothesis text (in-progress words)
-    const partialText = partialTokens
-      .map((t) => t.text)
-      .join("")
-      .replace(/\s+/g, " ")
-      .trim();
-
-    // Combined hypothesis: finals + current partials
+    const finalText = finalTokens.map((t) => t.text).join("").replace(/\s+/g, " ").trim();
+    const partialText = partialTokens.map((t) => t.text).join("").replace(/\s+/g, " ").trim();
     const hypothesis = [finalText, partialText].filter(Boolean).join(" ").trim();
 
     if (!hypothesis) return;
 
     const isFinal = partialTokens.length === 0 && finalTokens.length > 0;
-
-    console.log(`📝 Sending transcription (${isFinal ? "final" : "partial"}):`, hypothesis);
+    console.log(`📝 Transcription (${isFinal ? "final" : "partial"}):`, hypothesis);
 
     if (vapiWs.readyState === WebSocket.OPEN) {
       vapiWs.send(
