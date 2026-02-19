@@ -5,12 +5,9 @@ const PORT = process.env.PORT || 10000;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 
 /* -------------------- STEREO → MONO -------------------- */
-// Vapi sends stereo linear16 (2ch interleaved). Soniox only needs customer
-// audio (channel 0 = customer, channel 1 = assistant per Vapi docs).
-// We extract only channel 0 (left = customer).
 function extractMonoChannel(stereoBuf, channelIndex = 0) {
-  const totalSamples = Math.floor(stereoBuf.length / 2); // total int16 samples
-  const frames = Math.floor(totalSamples / 2);           // stereo frames
+  const totalSamples = Math.floor(stereoBuf.length / 2);
+  const frames = Math.floor(totalSamples / 2);
   const monoBuf = Buffer.allocUnsafe(frames * 2);
   for (let i = 0; i < frames; i++) {
     const sample = stereoBuf.readInt16LE((i * 2 + channelIndex) * 2);
@@ -53,28 +50,31 @@ wss.on("connection", (vapiWs) => {
     return;
   }
 
-  // Will be populated from Vapi's "start" message
   let sessionConfig = null;
-
-  // Soniox connection — created after we receive the start message
-  let sonioxWs = null;
-  let accumulatedFinalText = "";
   let frameCount = 0;
 
-  function connectToSoniox(sampleRate, channels) {
-    console.log(`🔧 Connecting to Soniox: sampleRate=${sampleRate} vapiChannels=${channels}`);
+  // ---- Customer channel (ch 0) ----
+  let customerSonioxWs = null;
+  let customerAccumulated = "";
 
-    sonioxWs = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
+  // ---- Assistant channel (ch 1) ----
+  let assistantSonioxWs = null;
+  let assistantAccumulated = "";
 
-    sonioxWs.on("open", () => {
-      console.log("✅ Connected to Soniox, sending config");
-      sonioxWs.send(
+  /* -------------------- SONIOX FACTORY -------------------- */
+  function createSonioxConnection(sampleRate, channelLabel) {
+    const ws = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
+    let accumulated = "";
+
+    ws.on("open", () => {
+      console.log(`✅ Soniox [${channelLabel}] connected`);
+      ws.send(
         JSON.stringify({
           api_key: SONIOX_API_KEY,
           model: "stt-rt-preview",
           audio_format: "pcm_s16le",
           sample_rate: sampleRate,
-          num_channels: 1,          // We extract mono customer channel before sending
+          num_channels: 1,
           language_hints: ["et"],
           language_hints_strict: true,
           enable_endpoint_detection: true,
@@ -82,85 +82,102 @@ wss.on("connection", (vapiWs) => {
       );
     });
 
-    sonioxWs.on("error", (err) => {
-      console.error("❌ Soniox error:", err);
-      try { vapiWs.close(); } catch {}
+    ws.on("error", (err) => {
+      console.error(`❌ Soniox [${channelLabel}] error:`, err.message);
     });
 
-    sonioxWs.on("close", (code, reason) => {
-      console.log("🔌 Soniox closed", code, reason?.toString?.() || "");
-      try { vapiWs.close(); } catch {}
+    ws.on("close", (code) => {
+      console.log(`🔌 Soniox [${channelLabel}] closed (${code})`);
     });
 
-    sonioxWs.on("message", (data) => {
-      const raw = data.toString();
-      console.log("📩 Soniox:", raw.slice(0, 200));
-
+    ws.on("message", (data) => {
       let response;
       try {
-        response = JSON.parse(raw);
+        response = JSON.parse(data.toString());
       } catch {
         return;
       }
 
       if (response.error_code) {
-        console.error("❌ Soniox error:", response.error_message);
+        console.error(`❌ Soniox [${channelLabel}] error:`, response.error_message);
         return;
       }
 
       if (response.finished) {
-        console.log("✅ Soniox session finished");
-        try { sonioxWs.close(); } catch {}
+        console.log(`✅ Soniox [${channelLabel}] session finished`);
         return;
       }
 
       const tokens = response.tokens;
       if (!tokens || tokens.length === 0) return;
 
-      // Final tokens arrive once and never repeat — accumulate them
-      const newFinalText = tokens
+      // Accumulate final tokens
+      const newFinals = tokens
         .filter((t) => t.is_final && t.text)
         .map((t) => t.text)
         .join("");
 
-      // Non-final tokens reset every message
-      const partialText = tokens
+      const partials = tokens
         .filter((t) => !t.is_final && t.text)
         .map((t) => t.text)
         .join("");
 
-      if (newFinalText) {
-        accumulatedFinalText += newFinalText;
-      }
+      if (newFinals) accumulated += newFinals;
 
-      const fullHypothesis = (accumulatedFinalText + partialText)
-        .replace(/\s+/g, " ")
-        .trim();
-
+      const fullHypothesis = (accumulated + partials).replace(/\s+/g, " ").trim();
       if (!fullHypothesis) return;
 
-      const isFinal = partialText.length === 0 && newFinalText.length > 0;
-      console.log(`📝 (${isFinal ? "final" : "partial"}):`, fullHypothesis);
-
+      // Send partial updates to Vapi for responsiveness
       if (vapiWs.readyState === WebSocket.OPEN) {
         vapiWs.send(
           JSON.stringify({
             type: "transcriber-response",
             transcription: fullHypothesis,
-            channel: "customer",
+            channel: channelLabel,
           })
         );
+        console.log(`📤 [${channelLabel}] → Vapi: "${fullHypothesis.slice(0, 80)}"`);
+      }
+
+      // When Soniox signals end of utterance (<end>), reset accumulator
+      // so next utterance starts fresh
+      if (accumulated.includes("<end>")) {
+        const cleaned = accumulated.replace(/<end>/g, "").trim();
+        console.log(`✅ [${channelLabel}] utterance complete: "${cleaned}"`);
+        accumulated = "";
+
+        // Send the clean final version one more time
+        if (cleaned && vapiWs.readyState === WebSocket.OPEN) {
+          vapiWs.send(
+            JSON.stringify({
+              type: "transcriber-response",
+              transcription: cleaned,
+              channel: channelLabel,
+            })
+          );
+        }
       }
     });
+
+    // Expose accumulated for external reset if needed
+    ws._getAccumulated = () => accumulated;
+    ws._resetAccumulated = () => { accumulated = ""; };
+
+    return ws;
   }
 
-  /* -------- Vapi → Soniox -------- */
+  /* -------------------- CONNECT BOTH CHANNELS -------------------- */
+  function connectToSoniox(sampleRate) {
+    console.log(`🔧 Starting dual Soniox connections at ${sampleRate}Hz`);
+    customerSonioxWs = createSonioxConnection(sampleRate, "customer");
+    assistantSonioxWs = createSonioxConnection(sampleRate, "assistant");
+  }
+
+  /* -------------------- VAPI → SONIOX -------------------- */
   vapiWs.on("message", (data, isBinary) => {
-    // Handle JSON control messages from Vapi
     if (!isBinary) {
       const text = data.toString();
       console.log("📨 Vapi JSON:", text.slice(0, 300));
-
       try {
         const msg = JSON.parse(text);
         if (msg.type === "start") {
@@ -168,44 +185,54 @@ wss.on("connection", (vapiWs) => {
             sampleRate: msg.sampleRate || 16000,
             channels: msg.channels || 2,
           };
-          console.log(`🚀 Got start message: sampleRate=${sessionConfig.sampleRate} channels=${sessionConfig.channels}`);
-          connectToSoniox(sessionConfig.sampleRate, sessionConfig.channels);
+          console.log(`🚀 Start: sampleRate=${sessionConfig.sampleRate} channels=${sessionConfig.channels}`);
+          connectToSoniox(sessionConfig.sampleRate);
         }
       } catch {}
       return;
     }
 
-    // Binary audio data
     if (!sessionConfig) {
-      console.warn("⚠️ Audio received before start message, dropping");
+      console.warn("⚠️ Audio before start message, dropping");
       return;
     }
 
-    if (!sonioxWs || sonioxWs.readyState !== WebSocket.OPEN) return;
-
     frameCount++;
 
-    // If stereo, extract customer channel (ch 0) only
-    const audioToSend = sessionConfig.channels === 2
-      ? extractMonoChannel(data, 0)
-      : data;
+    if (sessionConfig.channels === 2) {
+      // Extract and route each channel independently
+      const customerAudio = extractMonoChannel(data, 0);
+      const assistantAudio = extractMonoChannel(data, 1);
 
-    if (frameCount % 20 === 0) {
-      const rms = rmsS16LE(audioToSend);
-      console.log(`🔎 rms=${rms.toFixed(2)} bytes_in=${data.length} bytes_out=${audioToSend.length}`);
+      if (customerSonioxWs?.readyState === WebSocket.OPEN) {
+        customerSonioxWs.send(customerAudio);
+      }
+      if (assistantSonioxWs?.readyState === WebSocket.OPEN) {
+        assistantSonioxWs.send(assistantAudio);
+      }
+
+      if (frameCount % 20 === 0) {
+        const rms = rmsS16LE(customerAudio);
+        console.log(`🔎 [customer] rms=${rms.toFixed(2)} bytes_in=${data.length} bytes_out=${customerAudio.length}`);
+      }
+    } else {
+      // Mono — send to customer only
+      if (customerSonioxWs?.readyState === WebSocket.OPEN) {
+        customerSonioxWs.send(data);
+      }
     }
-
-    sonioxWs.send(audioToSend);
   });
 
+  /* -------------------- CLEANUP -------------------- */
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
-    if (sonioxWs && sonioxWs.readyState === WebSocket.OPEN) {
-      try {
-        // Per Soniox docs: empty binary frame = end of audio
-        sonioxWs.send(Buffer.alloc(0));
-      } catch {}
-    }
+    const endFrame = Buffer.alloc(0);
+    try {
+      if (customerSonioxWs?.readyState === WebSocket.OPEN) customerSonioxWs.send(endFrame);
+    } catch {}
+    try {
+      if (assistantSonioxWs?.readyState === WebSocket.OPEN) assistantSonioxWs.send(endFrame);
+    } catch {}
   });
 
   vapiWs.on("error", (err) => {
