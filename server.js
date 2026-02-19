@@ -5,7 +5,6 @@ const PORT = process.env.PORT || 10000;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 
 /* -------------------- AUDIO DEBUG -------------------- */
-
 function rmsS16LE(buf) {
   const n = Math.floor(buf.length / 2);
   if (n <= 0) return 0;
@@ -28,14 +27,12 @@ function peakAbsS16LE(buf) {
 }
 
 /* -------------------- HTTP SERVER -------------------- */
-
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("ok");
     return;
   }
-
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("soniox-vapi-ws-proxy up");
 });
@@ -55,16 +52,14 @@ wss.on("connection", (vapiWs) => {
 
   sonioxWs.on("open", () => {
     console.log("✅ Connected to Soniox, sending config");
-
-    // Matches what we've observed from Vapi Web calls: raw PCM s16le @ 44.1kHz mono
     sonioxWs.send(
       JSON.stringify({
         api_key: SONIOX_API_KEY,
         model: "stt-rt-preview",
         audio_format: "pcm_s16le",
-        sample_rate: 44100,
+        sample_rate: 16000,         // Vapi sends 16kHz telephony audio
         num_channels: 1,
-        language_hints: ["en"],
+        language_hints: ["et"],     // Estonian
         language_hints_strict: true,
         enable_endpoint_detection: true
       })
@@ -83,9 +78,13 @@ wss.on("connection", (vapiWs) => {
 
   let frameCount = 0;
 
-  /* -------- Vapi → Soniox (Raw Audio) -------- */
+  /* -------- Vapi → Soniox -------- */
   vapiWs.on("message", (data) => {
-    if (!Buffer.isBuffer(data)) return;
+    // Log non-binary messages from Vapi instead of silently dropping them
+    if (!Buffer.isBuffer(data)) {
+      console.log("📨 Vapi JSON message:", data.toString().slice(0, 300));
+      return;
+    }
 
     frameCount++;
 
@@ -103,9 +102,12 @@ wss.on("connection", (vapiWs) => {
 
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
-    try {
-      sonioxWs.send(JSON.stringify({ type: "finalize" }));
-    } catch {}
+    // Signal end of stream to Soniox so it flushes final transcript
+    if (sonioxWs.readyState === WebSocket.OPEN) {
+      try {
+        sonioxWs.send(JSON.stringify({ type: "end_of_stream" }));
+      } catch {}
+    }
     try { sonioxWs.close(); } catch {}
   });
 
@@ -129,24 +131,43 @@ wss.on("connection", (vapiWs) => {
     const tokens = response.tokens;
     if (!tokens || tokens.length === 0) return;
 
-    // Send live hypothesis (partial + final)
-    const hypothesis = tokens
+    // Separate final and non-final tokens
+    const finalTokens = tokens.filter((t) => t.is_final);
+    const partialTokens = tokens.filter((t) => !t.is_final);
+
+    // Build final transcript text (committed words)
+    const finalText = finalTokens
       .map((t) => t.text)
       .join("")
       .replace(/\s+/g, " ")
       .trim();
 
+    // Build partial/hypothesis text (in-progress words)
+    const partialText = partialTokens
+      .map((t) => t.text)
+      .join("")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    // Combined hypothesis: finals + current partials
+    const hypothesis = [finalText, partialText].filter(Boolean).join(" ").trim();
+
     if (!hypothesis) return;
 
-    console.log("📝 Sending transcription:", hypothesis);
+    const isFinal = partialTokens.length === 0 && finalTokens.length > 0;
 
-    vapiWs.send(
-      JSON.stringify({
-        type: "transcriber-response",
-        transcription: hypothesis,
-        channel: "customer"
-      })
-    );
+    console.log(`📝 Sending transcription (${isFinal ? "final" : "partial"}):`, hypothesis);
+
+    if (vapiWs.readyState === WebSocket.OPEN) {
+      vapiWs.send(
+        JSON.stringify({
+          type: "transcriber-response",
+          transcription: hypothesis,
+          isFinal,
+          channel: "customer"
+        })
+      );
+    }
   });
 });
 
