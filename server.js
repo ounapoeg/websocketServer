@@ -4,31 +4,19 @@ import WebSocket, { WebSocketServer } from "ws";
 const PORT = process.env.PORT || 10000;
 const SONIOX_API_KEY = process.env.SONIOX_API_KEY;
 
-const INPUT_SAMPLE_RATE = 44100;
-const OUTPUT_SAMPLE_RATE = 16000;
-const RATIO = INPUT_SAMPLE_RATE / OUTPUT_SAMPLE_RATE; // 2.75625
-
-/* -------------------- RESAMPLE -------------------- */
-function resampleS16LE(inputBuf) {
-  const inputSamples = Math.floor(inputBuf.length / 2);
-  const outputSamples = Math.floor(inputSamples / RATIO);
-  const outputBuf = Buffer.allocUnsafe(outputSamples * 2);
-
-  for (let i = 0; i < outputSamples; i++) {
-    const srcPos = i * RATIO;
-    const srcIdx = Math.floor(srcPos);
-    const frac = srcPos - srcIdx;
-
-    const s0 = inputBuf.readInt16LE(srcIdx * 2);
-    const s1 = srcIdx + 1 < inputSamples
-      ? inputBuf.readInt16LE((srcIdx + 1) * 2)
-      : s0;
-
-    const interpolated = Math.round(s0 + frac * (s1 - s0));
-    outputBuf.writeInt16LE(Math.max(-32768, Math.min(32767, interpolated)), i * 2);
+/* -------------------- STEREO → MONO -------------------- */
+// Vapi sends stereo linear16 (2ch interleaved). Soniox only needs customer
+// audio (channel 0 = customer, channel 1 = assistant per Vapi docs).
+// We extract only channel 0 (left = customer).
+function extractMonoChannel(stereoBuf, channelIndex = 0) {
+  const totalSamples = Math.floor(stereoBuf.length / 2); // total int16 samples
+  const frames = Math.floor(totalSamples / 2);           // stereo frames
+  const monoBuf = Buffer.allocUnsafe(frames * 2);
+  for (let i = 0; i < frames; i++) {
+    const sample = stereoBuf.readInt16LE((i * 2 + channelIndex) * 2);
+    monoBuf.writeInt16LE(sample, i * 2);
   }
-
-  return outputBuf;
+  return monoBuf;
 }
 
 /* -------------------- AUDIO DEBUG -------------------- */
@@ -41,16 +29,6 @@ function rmsS16LE(buf) {
     sumSq += s * s;
   }
   return Math.sqrt(sumSq / n);
-}
-
-function peakAbsS16LE(buf) {
-  const n = Math.floor(buf.length / 2);
-  let peak = 0;
-  for (let i = 0; i < n; i++) {
-    const s = Math.abs(buf.readInt16LE(i * 2));
-    if (s > peak) peak = s;
-  }
-  return peak;
 }
 
 /* -------------------- HTTP SERVER -------------------- */
@@ -75,138 +53,164 @@ wss.on("connection", (vapiWs) => {
     return;
   }
 
-  const sonioxWs = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
+  // Will be populated from Vapi's "start" message
+  let sessionConfig = null;
 
-  // Accumulated final tokens across all messages — never reset these
+  // Soniox connection — created after we receive the start message
+  let sonioxWs = null;
   let accumulatedFinalText = "";
-
-  sonioxWs.on("open", () => {
-    console.log("✅ Connected to Soniox, sending config");
-    sonioxWs.send(
-      JSON.stringify({
-        api_key: SONIOX_API_KEY,
-        model: "stt-rt-preview",
-        audio_format: "pcm_s16le",
-        sample_rate: OUTPUT_SAMPLE_RATE,
-        num_channels: 1,
-        language_hints: ["et"],
-        language_hints_strict: true,
-        enable_endpoint_detection: true,
-      })
-    );
-  });
-
-  sonioxWs.on("error", (err) => {
-    console.error("❌ Soniox error:", err);
-    try { vapiWs.close(); } catch {}
-  });
-
-  sonioxWs.on("close", (code, reason) => {
-    console.log("🔌 Soniox closed", code, reason?.toString?.() || "");
-    try { vapiWs.close(); } catch {}
-  });
-
   let frameCount = 0;
 
+  function connectToSoniox(sampleRate, channels) {
+    console.log(`🔧 Connecting to Soniox: sampleRate=${sampleRate} vapiChannels=${channels}`);
+
+    sonioxWs = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
+
+    sonioxWs.on("open", () => {
+      console.log("✅ Connected to Soniox, sending config");
+      sonioxWs.send(
+        JSON.stringify({
+          api_key: SONIOX_API_KEY,
+          model: "stt-rt-preview",
+          audio_format: "pcm_s16le",
+          sample_rate: sampleRate,
+          num_channels: 1,          // We extract mono customer channel before sending
+          language_hints: ["et"],
+          language_hints_strict: true,
+          enable_endpoint_detection: true,
+        })
+      );
+    });
+
+    sonioxWs.on("error", (err) => {
+      console.error("❌ Soniox error:", err);
+      try { vapiWs.close(); } catch {}
+    });
+
+    sonioxWs.on("close", (code, reason) => {
+      console.log("🔌 Soniox closed", code, reason?.toString?.() || "");
+      try { vapiWs.close(); } catch {}
+    });
+
+    sonioxWs.on("message", (data) => {
+      const raw = data.toString();
+      console.log("📩 Soniox:", raw.slice(0, 200));
+
+      let response;
+      try {
+        response = JSON.parse(raw);
+      } catch {
+        return;
+      }
+
+      if (response.error_code) {
+        console.error("❌ Soniox error:", response.error_message);
+        return;
+      }
+
+      if (response.finished) {
+        console.log("✅ Soniox session finished");
+        try { sonioxWs.close(); } catch {}
+        return;
+      }
+
+      const tokens = response.tokens;
+      if (!tokens || tokens.length === 0) return;
+
+      // Final tokens arrive once and never repeat — accumulate them
+      const newFinalText = tokens
+        .filter((t) => t.is_final && t.text)
+        .map((t) => t.text)
+        .join("");
+
+      // Non-final tokens reset every message
+      const partialText = tokens
+        .filter((t) => !t.is_final && t.text)
+        .map((t) => t.text)
+        .join("");
+
+      if (newFinalText) {
+        accumulatedFinalText += newFinalText;
+      }
+
+      const fullHypothesis = (accumulatedFinalText + partialText)
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (!fullHypothesis) return;
+
+      const isFinal = partialText.length === 0 && newFinalText.length > 0;
+      console.log(`📝 (${isFinal ? "final" : "partial"}):`, fullHypothesis);
+
+      if (vapiWs.readyState === WebSocket.OPEN) {
+        vapiWs.send(
+          JSON.stringify({
+            type: "transcriber-response",
+            transcription: fullHypothesis,
+            isFinal,
+            channel: "customer",
+          })
+        );
+      }
+    });
+  }
+
   /* -------- Vapi → Soniox -------- */
-  vapiWs.on("message", (data) => {
-    if (!Buffer.isBuffer(data)) {
-      console.log("📨 Vapi JSON message:", data.toString().slice(0, 300));
+  vapiWs.on("message", (data, isBinary) => {
+    // Handle JSON control messages from Vapi
+    if (!isBinary) {
+      const text = data.toString();
+      console.log("📨 Vapi JSON:", text.slice(0, 300));
+
+      try {
+        const msg = JSON.parse(text);
+        if (msg.type === "start") {
+          sessionConfig = {
+            sampleRate: msg.sampleRate || 16000,
+            channels: msg.channels || 2,
+          };
+          console.log(`🚀 Got start message: sampleRate=${sessionConfig.sampleRate} channels=${sessionConfig.channels}`);
+          connectToSoniox(sessionConfig.sampleRate, sessionConfig.channels);
+        }
+      } catch {}
       return;
     }
 
+    // Binary audio data
+    if (!sessionConfig) {
+      console.warn("⚠️ Audio received before start message, dropping");
+      return;
+    }
+
+    if (!sonioxWs || sonioxWs.readyState !== WebSocket.OPEN) return;
+
     frameCount++;
 
-    if (frameCount % 20 === 0) {
-      const rms = rmsS16LE(data);
-      const peak = peakAbsS16LE(data);
-      console.log(`🔎 Raw    rms=${rms.toFixed(2)} peak=${peak} bytes=${data.length}`);
-    }
-
-    if (sonioxWs.readyState !== WebSocket.OPEN) return;
-
-    const resampled = resampleS16LE(data);
+    // If stereo, extract customer channel (ch 0) only
+    const audioToSend = sessionConfig.channels === 2
+      ? extractMonoChannel(data, 0)
+      : data;
 
     if (frameCount % 20 === 0) {
-      const rms2 = rmsS16LE(resampled);
-      console.log(`🔎 Resamp rms=${rms2.toFixed(2)} bytes=${resampled.length}`);
+      const rms = rmsS16LE(audioToSend);
+      console.log(`🔎 rms=${rms.toFixed(2)} bytes_in=${data.length} bytes_out=${audioToSend.length}`);
     }
 
-    sonioxWs.send(resampled);
+    sonioxWs.send(audioToSend);
   });
 
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
-    if (sonioxWs.readyState === WebSocket.OPEN) {
+    if (sonioxWs && sonioxWs.readyState === WebSocket.OPEN) {
       try {
-        // Per Soniox docs: send an empty frame to signal end of audio
+        // Per Soniox docs: empty binary frame = end of audio
         sonioxWs.send(Buffer.alloc(0));
       } catch {}
     }
   });
 
-  /* -------- Soniox → Vapi (Transcript) -------- */
-  sonioxWs.on("message", (data) => {
-    const raw = data.toString();
-    console.log("📩 Soniox response:", raw.slice(0, 200));
-
-    let response;
-    try {
-      response = JSON.parse(raw);
-    } catch {
-      return;
-    }
-
-    if (response.error_code) {
-      console.error("❌ Soniox error:", response.error_message);
-      return;
-    }
-
-    if (response.finished) {
-      console.log("✅ Soniox session finished");
-      try { sonioxWs.close(); } catch {}
-      return;
-    }
-
-    const tokens = response.tokens;
-    if (!tokens || tokens.length === 0) return;
-
-    // Per docs: final tokens are sent ONCE and never repeated — accumulate them
-    const newFinalText = tokens
-      .filter((t) => t.is_final && t.text)
-      .map((t) => t.text)
-      .join("");
-
-    // Non-final tokens reset every message — they're the current hypothesis tail
-    const partialText = tokens
-      .filter((t) => !t.is_final && t.text)
-      .map((t) => t.text)
-      .join("");
-
-    if (newFinalText) {
-      accumulatedFinalText += newFinalText;
-    }
-
-    const fullHypothesis = (accumulatedFinalText + partialText)
-      .replace(/\s+/g, " ")
-      .trim();
-
-    if (!fullHypothesis) return;
-
-    const isFinal = partialText.length === 0 && newFinalText.length > 0;
-
-    console.log(`📝 (${isFinal ? "final" : "partial"}):`, fullHypothesis);
-
-    if (vapiWs.readyState === WebSocket.OPEN) {
-      vapiWs.send(
-        JSON.stringify({
-          type: "transcriber-response",
-          transcription: fullHypothesis,
-          isFinal,
-          channel: "customer",
-        })
-      );
-    }
+  vapiWs.on("error", (err) => {
+    console.error("❌ Vapi WS error:", err);
   });
 });
 
