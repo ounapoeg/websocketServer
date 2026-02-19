@@ -9,7 +9,6 @@ const OUTPUT_SAMPLE_RATE = 16000;
 const RATIO = INPUT_SAMPLE_RATE / OUTPUT_SAMPLE_RATE; // 2.75625
 
 /* -------------------- RESAMPLE -------------------- */
-// Simple linear interpolation downsampler: 44100 → 16000
 function resampleS16LE(inputBuf) {
   const inputSamples = Math.floor(inputBuf.length / 2);
   const outputSamples = Math.floor(inputSamples / RATIO);
@@ -26,8 +25,7 @@ function resampleS16LE(inputBuf) {
       : s0;
 
     const interpolated = Math.round(s0 + frac * (s1 - s0));
-    const clamped = Math.max(-32768, Math.min(32767, interpolated));
-    outputBuf.writeInt16LE(clamped, i * 2);
+    outputBuf.writeInt16LE(Math.max(-32768, Math.min(32767, interpolated)), i * 2);
   }
 
   return outputBuf;
@@ -79,6 +77,9 @@ wss.on("connection", (vapiWs) => {
 
   const sonioxWs = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
 
+  // Accumulated final tokens across all messages — never reset these
+  let accumulatedFinalText = "";
+
   sonioxWs.on("open", () => {
     console.log("✅ Connected to Soniox, sending config");
     sonioxWs.send(
@@ -86,11 +87,11 @@ wss.on("connection", (vapiWs) => {
         api_key: SONIOX_API_KEY,
         model: "stt-rt-preview",
         audio_format: "pcm_s16le",
-        sample_rate: OUTPUT_SAMPLE_RATE,  // 16000 after resampling
+        sample_rate: OUTPUT_SAMPLE_RATE,
         num_channels: 1,
-        language_hints: ["et"],           // Estonian
+        language_hints: ["et"],
         language_hints_strict: true,
-        enable_endpoint_detection: true
+        enable_endpoint_detection: true,
       })
     );
   });
@@ -119,7 +120,7 @@ wss.on("connection", (vapiWs) => {
     if (frameCount % 20 === 0) {
       const rms = rmsS16LE(data);
       const peak = peakAbsS16LE(data);
-      console.log(`🔎 Raw audio  rms=${rms.toFixed(2)} peak=${peak} bytes=${data.length}`);
+      console.log(`🔎 Raw    rms=${rms.toFixed(2)} peak=${peak} bytes=${data.length}`);
     }
 
     if (sonioxWs.readyState !== WebSocket.OPEN) return;
@@ -128,7 +129,7 @@ wss.on("connection", (vapiWs) => {
 
     if (frameCount % 20 === 0) {
       const rms2 = rmsS16LE(resampled);
-      console.log(`🔎 Resampled  rms=${rms2.toFixed(2)} bytes=${resampled.length}`);
+      console.log(`🔎 Resamp rms=${rms2.toFixed(2)} bytes=${resampled.length}`);
     }
 
     sonioxWs.send(resampled);
@@ -136,8 +137,12 @@ wss.on("connection", (vapiWs) => {
 
   vapiWs.on("close", () => {
     console.log("🔌 Vapi closed");
-    // Just close the socket — Soniox does not accept a JSON end_of_stream message
-    try { sonioxWs.close(1000); } catch {}
+    if (sonioxWs.readyState === WebSocket.OPEN) {
+      try {
+        // Per Soniox docs: send an empty frame to signal end of audio
+        sonioxWs.send(Buffer.alloc(0));
+      } catch {}
+    }
   });
 
   /* -------- Soniox → Vapi (Transcript) -------- */
@@ -157,28 +162,48 @@ wss.on("connection", (vapiWs) => {
       return;
     }
 
+    if (response.finished) {
+      console.log("✅ Soniox session finished");
+      try { sonioxWs.close(); } catch {}
+      return;
+    }
+
     const tokens = response.tokens;
     if (!tokens || tokens.length === 0) return;
 
-    const finalTokens = tokens.filter((t) => t.is_final);
-    const partialTokens = tokens.filter((t) => !t.is_final);
+    // Per docs: final tokens are sent ONCE and never repeated — accumulate them
+    const newFinalText = tokens
+      .filter((t) => t.is_final && t.text)
+      .map((t) => t.text)
+      .join("");
 
-    const finalText = finalTokens.map((t) => t.text).join("").replace(/\s+/g, " ").trim();
-    const partialText = partialTokens.map((t) => t.text).join("").replace(/\s+/g, " ").trim();
-    const hypothesis = [finalText, partialText].filter(Boolean).join(" ").trim();
+    // Non-final tokens reset every message — they're the current hypothesis tail
+    const partialText = tokens
+      .filter((t) => !t.is_final && t.text)
+      .map((t) => t.text)
+      .join("");
 
-    if (!hypothesis) return;
+    if (newFinalText) {
+      accumulatedFinalText += newFinalText;
+    }
 
-    const isFinal = partialTokens.length === 0 && finalTokens.length > 0;
-    console.log(`📝 Transcription (${isFinal ? "final" : "partial"}):`, hypothesis);
+    const fullHypothesis = (accumulatedFinalText + partialText)
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!fullHypothesis) return;
+
+    const isFinal = partialText.length === 0 && newFinalText.length > 0;
+
+    console.log(`📝 (${isFinal ? "final" : "partial"}):`, fullHypothesis);
 
     if (vapiWs.readyState === WebSocket.OPEN) {
       vapiWs.send(
         JSON.stringify({
           type: "transcriber-response",
-          transcription: hypothesis,
+          transcription: fullHypothesis,
           isFinal,
-          channel: "customer"
+          channel: "customer",
         })
       );
     }
