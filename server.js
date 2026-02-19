@@ -52,18 +52,14 @@ wss.on("connection", (vapiWs) => {
 
   let sessionConfig = null;
   let frameCount = 0;
-
-  // ---- Customer channel (ch 0) ----
   let customerSonioxWs = null;
-  let customerAccumulated = "";
-
-  // ---- Assistant channel (ch 1) ----
   let assistantSonioxWs = null;
-  let assistantAccumulated = "";
 
   /* -------------------- SONIOX FACTORY -------------------- */
   function createSonioxConnection(sampleRate, channelLabel) {
     const ws = new WebSocket("wss://stt-rt.soniox.com/transcribe-websocket");
+
+    // Accumulates only final tokens. Reset after each <end> boundary.
     let accumulated = "";
 
     ws.on("open", () => {
@@ -111,57 +107,39 @@ wss.on("connection", (vapiWs) => {
       const tokens = response.tokens;
       if (!tokens || tokens.length === 0) return;
 
-      // Accumulate final tokens
+      // Only accumulate final tokens — these are stable, committed words.
+      // We intentionally ignore non-final (partial) tokens entirely.
+      // Sending partials to Vapi caused the growing blob of repeated text.
       const newFinals = tokens
         .filter((t) => t.is_final && t.text)
         .map((t) => t.text)
         .join("");
 
-      const partials = tokens
-        .filter((t) => !t.is_final && t.text)
-        .map((t) => t.text)
-        .join("");
-
-      if (newFinals) accumulated += newFinals;
-
-      const fullHypothesis = (accumulated + partials).replace(/\s+/g, " ").trim();
-      if (!fullHypothesis) return;
-
-      // Send partial updates to Vapi for responsiveness
-      if (vapiWs.readyState === WebSocket.OPEN) {
-        vapiWs.send(
-          JSON.stringify({
-            type: "transcriber-response",
-            transcription: fullHypothesis,
-            channel: channelLabel,
-          })
-        );
-        console.log(`📤 [${channelLabel}] → Vapi: "${fullHypothesis.slice(0, 80)}"`);
+      if (newFinals) {
+        accumulated += newFinals;
+        console.log(`📝 [${channelLabel}] accumulated: "${accumulated.slice(-80)}"`);
       }
 
-      // When Soniox signals end of utterance (<end>), reset accumulator
-      // so next utterance starts fresh
-      if (accumulated.includes("<end>")) {
-        const cleaned = accumulated.replace(/<end>/g, "").trim();
-        console.log(`✅ [${channelLabel}] utterance complete: "${cleaned}"`);
-        accumulated = "";
+      // <end> is Soniox's sentence boundary marker.
+      // Only send to Vapi when a complete sentence is ready.
+      // Loop handles multiple <end> markers in one message (rare but possible).
+      while (accumulated.includes("<end>")) {
+        const endIdx = accumulated.indexOf("<end>");
+        const utterance = accumulated.slice(0, endIdx).trim();
+        accumulated = accumulated.slice(endIdx + 5); // advance past "<end>"
 
-        // Send the clean final version one more time
-        if (cleaned && vapiWs.readyState === WebSocket.OPEN) {
+        if (utterance && vapiWs.readyState === WebSocket.OPEN) {
+          console.log(`📤 [${channelLabel}] → Vapi: "${utterance}"`);
           vapiWs.send(
             JSON.stringify({
               type: "transcriber-response",
-              transcription: cleaned,
+              transcription: utterance,
               channel: channelLabel,
             })
           );
         }
       }
     });
-
-    // Expose accumulated for external reset if needed
-    ws._getAccumulated = () => accumulated;
-    ws._resetAccumulated = () => { accumulated = ""; };
 
     return ws;
   }
@@ -200,7 +178,6 @@ wss.on("connection", (vapiWs) => {
     frameCount++;
 
     if (sessionConfig.channels === 2) {
-      // Extract and route each channel independently
       const customerAudio = extractMonoChannel(data, 0);
       const assistantAudio = extractMonoChannel(data, 1);
 
@@ -216,7 +193,6 @@ wss.on("connection", (vapiWs) => {
         console.log(`🔎 [customer] rms=${rms.toFixed(2)} bytes_in=${data.length} bytes_out=${customerAudio.length}`);
       }
     } else {
-      // Mono — send to customer only
       if (customerSonioxWs?.readyState === WebSocket.OPEN) {
         customerSonioxWs.send(data);
       }
